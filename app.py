@@ -76,29 +76,16 @@ _DRAWING_NUMBER_RE = re.compile(
     r"^[A-Za-z]{0,5}[-_]?\d{1,5}[A-Za-z0-9\-_.]*$"
 )
 
-# Scale expressions at the tail of a text line.
-_SCALE_RE = re.compile(
-    r"\b(1\s*[:/]\s*\d+|NTS|N\.T\.S\.|AS\s+SHOWN)\b",
-    re.IGNORECASE,
+# Cell-level drawing-number regex used by the PDF grid parser.
+# A whole cell must look like "AA-001", "AA - 001", "A 101", "MEP-12B", ...
+#   group(1) = letter prefix  (1-5 letters)
+#   group(2) = numeric core   (1-5 digits, optional trailing alphanumeric)
+_CELL_DRAWING_NO_RE = re.compile(
+    r"^\s*([A-Za-z]{1,5})\s*[-_ ]+\s*(\d{1,5}[A-Za-z0-9]*)\s*$"
 )
 
-# Primary line-level regex for real-world Korean drawing lists of the form:
-#     "AA - 401 101동 영구저류조 (SL+53.355) 전체 평면도 1/100 1/200"
-# Captures:
-#     1) letter prefix      : "AA"
-#     2) numeric core       : "401"      (optionally followed by A-Z0-9)
-#     3) drawing name       : "101동 ... 전체 평면도"       (non-greedy)
-#     4) trailing scale(s)  : "1/100 1/200"  (optional - may be absent)
-_PDF_LINE_SPACED_RE = re.compile(
-    r"^\s*([A-Za-z]{1,5})\s*-\s*(\d{1,5}[A-Za-z0-9]*)\s+"
-    r"(.+?)"
-    r"(?:\s+("
-    r"\d+\s*/\s*\d+(?:\s+\d+\s*/\s*\d+)*"        # 1/100  or  1/100 1/200
-    r"|\d+\s*:\s*\d+"                              # 1:100
-    r"|NTS|N\.T\.S\.|AS\s+SHOWN"                   # textual scales
-    r"))?\s*$",
-    re.IGNORECASE,
-)
+# Scale cell values that should be treated as "no scale".
+_EMPTY_SCALE_TOKENS = {"", "NONE", "N/A", "N.A.", "-", "—", "–"}
 
 
 def _normalize_drawing_number(s: str) -> str:
@@ -155,19 +142,17 @@ def prompt_inputs() -> Tuple[str, str, str]:
 
 
 # ============================================================================
-# 2.  PDF EXTRACTION  (3-tier fallback)
+# 2.  PDF EXTRACTION  (strict line-based grid parser)
 # ============================================================================
-
-# ---- helpers ----------------------------------------------------------------
-
-def _find_col(header: List[str], keys: List[str]) -> Optional[int]:
-    """Return the column index of the first header cell containing any key."""
-    for i, cell in enumerate(header):
-        for k in keys:
-            if k in cell:
-                return i
-    return None
-
+#
+# The master drawing list is a grid table with visible horizontal / vertical
+# borders, often split into a left half and a right half on the same page.
+# The parser therefore uses pdfplumber with the "lines" table strategy and
+# scans each extracted row left-to-right: every cell that looks like a
+# Drawing Number opens a new entry whose Name / Scale come from the next
+# non-empty cells in the same row (up to the next Drawing Number, so split
+# layouts are handled naturally).
+# ----------------------------------------------------------------------------
 
 def _debug_pdf_page(page) -> None:
     """Print a raw-text snippet from a page so you can diagnose parsing."""
@@ -179,138 +164,85 @@ def _debug_pdf_page(page) -> None:
     print("[PDF ] -------------------------------------------------")
 
 
-def _rows_from_table(table: list) -> List[dict]:
-    """Convert a pdfplumber table (list-of-lists) into drawing-list dicts."""
-    if not table or len(table) < 2:
+def _normalize_cell(cell) -> str:
+    """Trim a pdfplumber cell value; return '' for None and collapse newlines."""
+    if cell is None:
+        return ""
+    return " ".join(str(cell).split()).strip()
+
+
+def _parse_grid_row(row: list) -> List[dict]:
+    """
+    Parse one pdfplumber table row into zero or more drawing entries.
+
+    Walks the row left-to-right. Every cell that matches
+    _CELL_DRAWING_NO_RE opens a new entry; the entry's slice extends up
+    to (but excluding) the next drawing-number cell in the same row.
+    Within that slice:
+
+      * first non-empty cell  -> Drawing Name
+      * second non-empty cell -> Scale   (normalised: NONE / "-" / "" -> "")
+
+    This makes empty Scale cells harmless — they never cause column
+    shift, because we anchor on the Drawing Number position instead of
+    assuming a fixed column layout.
+    """
+    cells = [_normalize_cell(c) for c in (row or [])]
+    n = len(cells)
+    if n == 0:
         return []
-    header = [(c or "").strip().lower() for c in table[0]]
-    idx_no    = _find_col(header, ["drawing number", "dwg no", "dwg. no",
-                                   "doc no", "doc. no", "no."])
-    idx_name  = _find_col(header, ["drawing name", "drawing title", "title",
-                                   "description", "name"])
-    idx_scale = _find_col(header, ["scale"])
-    if idx_no is None or idx_name is None:
+
+    # Locate every drawing-number cell in the row.
+    positions: List[Tuple[int, str]] = []
+    for i, cell in enumerate(cells):
+        m = _CELL_DRAWING_NO_RE.match(cell)
+        if m:
+            letters, digits = m.groups()
+            positions.append((i, f"{letters}-{digits}"))
+
+    if not positions:
         return []
-    rows: List[dict] = []
-    for raw in table[1:]:
-        if not raw or all((c or "").strip() == "" for c in raw):
-            continue
-        number = (raw[idx_no]   or "").strip() if idx_no   < len(raw) else ""
-        name   = (raw[idx_name] or "").strip() if idx_name < len(raw) else ""
-        scale  = ""
-        if idx_scale is not None and idx_scale < len(raw):
-            scale = (raw[idx_scale] or "").strip()
-        if not number:
-            continue
-        rows.append({
-            "Drawing Number": _normalize_drawing_number(number),
+
+    results: List[dict] = []
+    for idx, (pos, dwg_no) in enumerate(positions):
+        end = positions[idx + 1][0] if idx + 1 < len(positions) else n
+        segment = cells[pos + 1:end]
+        non_empty = [c for c in segment if c]
+
+        name  = non_empty[0] if len(non_empty) >= 1 else ""
+        scale = non_empty[1] if len(non_empty) >= 2 else ""
+
+        # "NONE", "-", etc. should be treated as empty so the Excel
+        # mismatch highlight doesn't fire spuriously.
+        if scale.strip().upper() in _EMPTY_SCALE_TOKENS:
+            scale = ""
+
+        results.append({
+            "Drawing Number": dwg_no,
             "Drawing Name":   name,
             "Scale":          scale,
         })
-    return rows
 
+    return results
 
-# ---- extraction tiers -------------------------------------------------------
-
-def _try_table_default(page) -> List[dict]:
-    """Tier 1: pdfplumber default table detection."""
-    rows: List[dict] = []
-    for table in (page.extract_tables() or []):
-        rows.extend(_rows_from_table(table))
-    return rows
-
-
-def _try_table_tuned(page) -> List[dict]:
-    """Tier 2: text-strategy table detection — works on borderless tables."""
-    settings = {
-        "vertical_strategy":    "text",
-        "horizontal_strategy":  "text",
-        "snap_tolerance":       5,
-        "join_tolerance":       3,
-        "edge_min_length":      10,
-        "min_words_vertical":   1,
-        "min_words_horizontal": 1,
-    }
-    rows: List[dict] = []
-    try:
-        for table in (page.extract_tables(table_settings=settings) or []):
-            rows.extend(_rows_from_table(table))
-    except Exception:
-        pass
-    return rows
-
-
-def _parse_text_line(line: str) -> Optional[dict]:
-    """
-    Parse one raw text line into {Drawing Number, Drawing Name, Scale}.
-
-    Two strategies:
-
-    A) Spaced-number regex - handles "AA - 401 Name ... 1/100":
-           AA - 401 101동 영구저류조 (SL+53.355) 전체 평면도 1/100 1/200
-
-    B) Fixed-width fallback - splits on 2+ spaces and uses the short
-       alphanumeric heuristic for the first column.
-    """
-    line = line.strip()
-    if not line:
-        return None
-
-    # ---- Strategy A: spaced drawing number regex ---------------------------
-    m = _PDF_LINE_SPACED_RE.match(line)
-    if m:
-        letters, digits, name, scale = m.groups()
-        return {
-            "Drawing Number": _normalize_drawing_number(f"{letters}-{digits}"),
-            "Drawing Name":   (name or "").strip(),
-            "Scale":          (scale or "").strip(),
-        }
-
-    # ---- Strategy B: fixed-width fallback ----------------------------------
-    scale = ""
-    m_sc = _SCALE_RE.search(line)
-    if m_sc:
-        scale = m_sc.group(1).strip()
-        line = (line[:m_sc.start()] + line[m_sc.end():]).strip()
-
-    parts = re.split(r"\s{2,}", line)
-    if len(parts) < 2:
-        return None
-
-    candidate_no   = parts[0].strip()
-    candidate_name = " ".join(p.strip() for p in parts[1:] if p.strip())
-
-    squashed = candidate_no.replace(" ", "")
-    if _DRAWING_NUMBER_RE.match(squashed) and any(ch.isdigit() for ch in squashed):
-        return {
-            "Drawing Number": _normalize_drawing_number(candidate_no),
-            "Drawing Name":   candidate_name,
-            "Scale":          scale,
-        }
-    return None
-
-
-def _try_text_regex(page) -> List[dict]:
-    """Tier 3: raw text extraction followed by per-line regex parsing."""
-    raw = page.extract_text() or ""
-    rows: List[dict] = []
-    for line in raw.splitlines():
-        row = _parse_text_line(line)
-        if row:
-            rows.append(row)
-    return rows
-
-
-# ---- main PDF function ------------------------------------------------------
 
 def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
     """
-    Parse every page of *pdf_path* and return a DataFrame with columns
-    ``Drawing Number``, ``Drawing Name``, ``Scale``.
+    Parse *pdf_path* assuming a strict line-bordered grid table and return
+    a DataFrame with columns ``Drawing Number``, ``Drawing Name``, ``Scale``.
+
+    Uses ``pdfplumber.Page.extract_tables`` with the "lines" strategy and
+    delegates per-row cell interpretation to :func:`_parse_grid_row`, which
+    handles split left/right layouts and empty / "NONE" scale cells.
     """
     print(f"[PDF ] Opening: {pdf_path}")
     all_rows: List[dict] = []
     debug_done = False
+
+    table_settings = {
+        "vertical_strategy":   "lines",
+        "horizontal_strategy": "lines",
+    }
 
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -321,22 +253,17 @@ def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
                     debug_done = True
 
                 before = len(all_rows)
+                tables = page.extract_tables(table_settings=table_settings) or []
 
-                page_rows = _try_table_default(page)
-                if page_rows:
-                    strategy = "table/default"
-                else:
-                    page_rows = _try_table_tuned(page)
-                    if page_rows:
-                        strategy = "table/tuned"
-                    else:
-                        page_rows = _try_text_regex(page)
-                        strategy = "text+regex"
+                for t_idx, table in enumerate(tables):
+                    if not table:
+                        continue
+                    for row in table:
+                        all_rows.extend(_parse_grid_row(row))
 
-                all_rows.extend(page_rows)
                 added = len(all_rows) - before
                 print(f"[PDF ] Page {page_no}: +{added} rows  "
-                      f"[strategy: {strategy}]  (total {len(all_rows)})")
+                      f"(tables: {len(tables)}, total {len(all_rows)})")
 
     except FileNotFoundError:
         print(f"[ERROR] PDF not found: {pdf_path}")
@@ -348,7 +275,20 @@ def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
     df = pd.DataFrame(all_rows, columns=["Drawing Number", "Drawing Name", "Scale"])
     if not df.empty:
         df = df.drop_duplicates(subset=["Drawing Number"]).reset_index(drop=True)
+
     print(f"[PDF ] Extracted {len(df)} unique drawings")
+
+    # Debug: show the first 10 rows of the resulting DataFrame so the
+    # user can verify structure before anything is written to Excel.
+    print("[PDF ] -------- DataFrame preview  df.head(10) --------")
+    if df.empty:
+        print("[PDF ]   (empty DataFrame)")
+    else:
+        preview = df.head(10).to_string(index=False)
+        for line in preview.splitlines():
+            print(f"[PDF ]   {line}")
+    print("[PDF ] ----------------------------------------------------")
+
     return df
 
 
