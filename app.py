@@ -50,10 +50,17 @@ from openpyxl.styles import PatternFill
 # ============================================================================
 
 # --- ODA File Converter ------------------------------------------------------
-# Full path to the OdaFileConverter executable. Set this to the path on your
-# machine; ezdxf will be configured automatically when the first DWG opens.
-# If left empty ("") ezdxf falls back to the system PATH search.
-ODA_PATH: str = r"C:\Program Files\ODA\ODAFileConverter 27.1.0\ODAFileConverter.exe"
+# Full path to the OdaFileConverter executable.
+#
+# Leave empty ("") to enable automatic detection. On startup the script will:
+#   1. search common install roots (C:\Program Files\ODA\*  and
+#      C:\Program Files (x86)\ODA\*) for OdaFileConverter.exe, picking the
+#      newest version folder it finds, then
+#   2. if nothing is found, prompt you interactively for the full path.
+#
+# You can still hardcode a path here if you prefer to skip detection, e.g.:
+#   ODA_PATH = r"C:\Program Files\ODA\ODAFileConverter 27.1.0\ODAFileConverter.exe"
+ODA_PATH: str = ""
 
 # --- Title-block search ratios ----------------------------------------------
 X_RATIO: float = 0.101    # 10.10 %  search width  = Title-Block Width  * X_RATIO
@@ -350,39 +357,130 @@ def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
 # ============================================================================
 
 # --- ODA File Converter configuration ---------------------------------------
-_odafc_configured = False
+_odafc_configured: bool = False
+_oda_resolved_path: str = ""   # populated by _resolve_oda_path()
+
+# Standard install roots searched during auto-detection.
+_ODA_SEARCH_ROOTS: Tuple[str, ...] = (
+    r"C:\Program Files\ODA",
+    r"C:\Program Files (x86)\ODA",
+)
+# Executable filenames (case variants — NTFS is case-insensitive but the
+# glob itself on other platforms is not).
+_ODA_EXE_NAMES: Tuple[str, ...] = (
+    "ODAFileConverter.exe",
+    "OdaFileConverter.exe",
+)
+
+
+def _autodetect_oda_path() -> str:
+    """
+    Walk the common ODA install roots and return the full path to
+    OdaFileConverter.exe (preferring the newest version folder). Returns
+    an empty string if nothing is found.
+    """
+    candidates: List[str] = []
+    for root in _ODA_SEARCH_ROOTS:
+        if not os.path.isdir(root):
+            continue
+        for exe in _ODA_EXE_NAMES:
+            # Typical layout: <root>\ODAFileConverter <version>\<exe>
+            candidates.extend(glob.glob(os.path.join(root, "*", exe)))
+            # Also accept the executable placed directly in <root>\<exe>
+            candidates.extend(glob.glob(os.path.join(root, exe)))
+
+    # De-duplicate and pick the lexicographically-highest match — for a
+    # folder like "ODAFileConverter 27.1.0" this naturally prefers the
+    # most recent version.
+    candidates = sorted({os.path.normpath(c) for c in candidates}, reverse=True)
+
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return ""
+
+
+def _resolve_oda_path() -> str:
+    """
+    Decide which OdaFileConverter.exe to use, in order of preference:
+
+      1. Honour ODA_PATH if the user set it manually at the top of this file.
+      2. Auto-detect inside the standard Windows install roots.
+      3. Fall back to interactive input().
+
+    The final value is cached in ``_oda_resolved_path`` and returned.
+    """
+    global _oda_resolved_path
+
+    # Hardcoded override wins.
+    if ODA_PATH and os.path.isfile(ODA_PATH):
+        _oda_resolved_path = ODA_PATH
+        return _oda_resolved_path
+    if ODA_PATH and not os.path.isfile(ODA_PATH):
+        print(f"[WARN] ODA_PATH is set but not a valid file: {ODA_PATH}")
+
+    # Auto-detect.
+    found = _autodetect_oda_path()
+    if found:
+        print(f"[INFO] Auto-detected ODA Converter at: {found}")
+        _oda_resolved_path = found
+        return _oda_resolved_path
+
+    # Fallback: prompt the user.
+    print("[WARN] Could not auto-detect OdaFileConverter.exe in the standard")
+    print("       install roots:")
+    for r in _ODA_SEARCH_ROOTS:
+        print(f"           {r}")
+    while True:
+        raw = input("Enter the exact file path for OdaFileConverter.exe: ").strip().strip('"').strip("'")
+        if not raw:
+            print("    ! Empty input. Please try again.")
+            continue
+        path = os.path.expanduser(os.path.expandvars(raw))
+        if not os.path.isfile(path):
+            print(f"    ! Not a valid file: {path}")
+            continue
+        _oda_resolved_path = os.path.abspath(path)
+        return _oda_resolved_path
 
 
 def _configure_odafc() -> None:
     """
-    Explicitly point ezdxf's odafc addon at the OdaFileConverter executable
-    defined in ODA_PATH. Called once before the first DWG open.
+    Resolve the OdaFileConverter executable path and push it into ezdxf's
+    ``odafc`` addon so subsequent DWG opens succeed. Called lazily (from
+    ``_load_doc``) on the first DWG file encountered.
 
-    Two APIs are attempted in order so the configuration works across ezdxf
+    Two configuration APIs are attempted so the setting works across ezdxf
     versions:
 
-    1.  ``ezdxf.addons.odafc.configs.odafc_exec_path``  (user-supplied hint)
-    2.  ``ezdxf.addons.odafc.win_exec_path`` /
-        ``ezdxf.addons.odafc.unix_exec_path``          (documented in 1.x)
+      1. ``ezdxf.addons.odafc.configs.odafc_exec_path``  (configs submodule)
+      2. ``ezdxf.addons.odafc.win_exec_path`` /
+         ``ezdxf.addons.odafc.unix_exec_path``            (documented in 1.x)
     """
     global _odafc_configured
-    if _odafc_configured or not ODA_PATH:
+    if _odafc_configured:
         return
 
-    # --- (1) user-requested configs submodule -------------------------------
+    path = _resolve_oda_path()
+    if not path:
+        # Nothing resolved - let ezdxf try its own PATH search as last resort.
+        _odafc_configured = True
+        return
+
+    # --- (1) configs submodule (try first, gracefully skip if missing) -----
     try:
         import ezdxf.addons.odafc.configs as odafc_configs  # type: ignore
-        odafc_configs.odafc_exec_path = ODA_PATH
+        odafc_configs.odafc_exec_path = path
     except Exception:
-        pass  # submodule does not exist in current ezdxf - fall through
+        pass
 
     # --- (2) documented module-level attribute API --------------------------
     try:
         from ezdxf.addons import odafc
         if sys.platform == "win32":
-            odafc.win_exec_path = ODA_PATH
+            odafc.win_exec_path = path
         else:
-            odafc.unix_exec_path = ODA_PATH
+            odafc.unix_exec_path = path
     except Exception as exc:
         print(f"[WARN] Could not set ezdxf odafc exec path: {exc}")
 
@@ -401,13 +499,13 @@ def _load_doc(path: Path):
 
     if suffix == ".dwg":
         _configure_odafc()
+        shown_path = _oda_resolved_path or ODA_PATH or "<system PATH>"
         try:
             from ezdxf.addons import odafc
             return odafc.readfile(str(path))
         except FileNotFoundError as exc:
-            # Raised by odafc when the converter binary itself is missing.
             raise RuntimeError(
-                f"ODA Converter not found at [{ODA_PATH or '<system PATH>'}] "
+                f"ODA Converter not found at [{shown_path}] "
                 f"(underlying error: {exc})"
             ) from exc
         except Exception as exc:
@@ -415,7 +513,7 @@ def _load_doc(path: Path):
             if "odafileconverter" in msg or "oda_file_converter" in msg \
                or "no such file" in msg or "cannot find" in msg:
                 raise RuntimeError(
-                    f"ODA Converter not found at [{ODA_PATH or '<system PATH>'}] "
+                    f"ODA Converter not found at [{shown_path}] "
                     f"(underlying error: {exc})"
                 ) from exc
             raise RuntimeError(
@@ -696,12 +794,17 @@ def main() -> None:
     print(f"[INFO] Target dir : {target_dir}")
     print(f"[INFO] PDF path   : {pdf_path}")
     print(f"[INFO] Block name : {block_name}")
-    if ODA_PATH:
-        print(f"[INFO] ODA path   : {ODA_PATH}")
     print("-" * 72)
 
-    # Configure ezdxf's ODA addon up front so the very first DWG open works.
-    _configure_odafc()
+    # Resolve & configure the ODA File Converter eagerly, but only when the
+    # target directory actually contains .dwg files — avoids prompting the
+    # user for a converter path they do not need.
+    dwg_hits = (
+        glob.glob(os.path.join(target_dir, "*.dwg"))
+        + glob.glob(os.path.join(target_dir, "*.DWG"))
+    )
+    if dwg_hits:
+        _configure_odafc()
 
     out_path = os.path.abspath(REPORT_NAME)
 
