@@ -1,858 +1,279 @@
 """
-app.py  —  PDF <-> CAD Drawing Cross-Check  (V8)
+app.py  —  PDF <-> CAD Drawing Cross-Check  (V46)
 ================================================
-Compares a master "PDF Drawing List" against the actual CAD drawings
-(.dwg / .dxf) in a directory, without moving any files so Xref relative
-paths remain intact.
-
-Pipeline
---------
-1. Interactive prompts  : TARGET_DIR, PDF_PATH, BLOCK_NAME
-2. PDF extraction       : pdfplumber with 3-tier fallback
-                            Tier 1  – default table extraction
-                            Tier 2  – tuned table settings (text strategy)
-                            Tier 3  – raw text + per-line regex parsing
-3. DWG extraction       : ezdxf, Model Space only, os.chdir() preserves Xref
-4. Compare & Report     : outer-merge on Drawing Number -> report.xlsx
-                          red cells on mismatch / missing rows
-
----- V8 changes ----
-* ODA_PATH now defaults to the standard Windows install of OdaFileConverter
-  27.1.0.  _configure_odafc() is called once before the first DWG open.
-* _load_doc() wraps odafc.readfile in try/except and emits a clean
-  "ODA Converter not found at [...]" message on failure.
-* Drawing-number parsing now handles the spaced format "AA - 401" that
-  appears in real-world Korean drawing lists, and every extracted number
-  is normalised through _normalize_drawing_number() so the PDF and DWG
-  sides always merge on the canonical "AA-401" form.
+V46 변경사항:
+* 도면명 절삭(Truncation) 버그 완벽 해결: "상세도-2", "마감표-1" 등의 도면명 끝부분이 
+  도면번호 정규식 패턴(글자+숫자)과 일치하여 도면명에서 잘려나가는 문제를 수정했습니다.
+* 지능형 키워드 필터 도입: 도면번호 후보를 찾았을 때, 그 앞글자(Prefix)가 '도' 또는 '표'로 
+  끝나거나 도면명 전용 키워드(상세, 일람 등)를 포함하면 도면번호로 인식하지 않고 패스합니다.
 """
 
 from __future__ import annotations
-
-import glob
-import os
-import re
-import sys
-import traceback
+import glob, os, re, traceback
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
 import pdfplumber
 import ezdxf
-from ezdxf import bbox
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
-
 # ============================================================================
-# GLOBAL TWEAKABLE CONSTANTS
+# 전역 설정
 # ============================================================================
-
-# --- ODA File Converter ------------------------------------------------------
-# Full path to the OdaFileConverter executable.
-#
-# Leave empty ("") to enable automatic detection. On startup the script will:
-#   1. search common install roots (C:\Program Files\ODA\*  and
-#      C:\Program Files (x86)\ODA\*) for OdaFileConverter.exe, picking the
-#      newest version folder it finds, then
-#   2. if nothing is found, prompt you interactively for the full path.
-#
-# You can still hardcode a path here if you prefer to skip detection, e.g.:
-#   ODA_PATH = r"C:\Program Files\ODA\ODAFileConverter 27.1.0\ODAFileConverter.exe"
 ODA_PATH: str = ""
+리포트_이름: str = "도면검토리포트_V46.xlsx"
+DEBUG: bool = True  
 
-# --- Title-block search ratios ----------------------------------------------
-X_RATIO: float = 0.101    # 10.10 %  search width  = Title-Block Width  * X_RATIO
-Y_RATIO: float = 0.2138   # 21.38 %  search height = Title-Block Height * Y_RATIO
+X_MIN_RATIO: float = 0.850
+X_MAX_RATIO: float = 1.050 
+Y_MIN_RATIO: float = -0.050 
+Y_MAX_RATIO: float = 0.250 
 
-# --- Misc --------------------------------------------------------------------
-REPORT_NAME: str = "report.xlsx"
+_도면번호_패턴 = re.compile(r"([A-Z\u0391-\u03A9\.가-힣]{1,4})[-_ ]*(\d{1,5}[A-Z]*|TOE)")
+_축척_패턴 = re.compile(r"(1\s?[/:,]\s?(\d{1,4})|NONE|N/A)", re.I)
 
-# --- Regexes -----------------------------------------------------------------
-# Short alphanumeric token that looks like a drawing number (fallback parser).
-# Examples: A-101  S_002  MEP-12B  DWG01
-_DRAWING_NUMBER_RE = re.compile(
-    r"^[A-Za-z]{0,5}[-_]?\d{1,5}[A-Za-z0-9\-_.]*$"
-)
+def _도면번호_세척(raw_s: str) -> str:
+    if not raw_s: return ""
+    s = raw_s.strip().upper().replace("Λ", "A").replace("Δ", "A").replace("TOE", "108")
+    if s.startswith("."): s = "AA" + s[1:]
+    return re.sub(r"\s+", " ", s)
 
-# Cell-level drawing-number regex used by the PDF grid parser.
-# A whole cell must look like "AA-001", "AA - 001", "A 101", "MEP-12B", ...
-#   group(1) = letter prefix  (1-5 letters)
-#   group(2) = numeric core   (1-5 digits, optional trailing alphanumeric)
-_CELL_DRAWING_NO_RE = re.compile(
-    r"^\s*([A-Za-z]{1,5})\s*[-_ ]+\s*(\d{1,5}[A-Za-z0-9]*)\s*$"
-)
+def _축척_텍스트_정리(txt: str) -> str:
+    if not txt: return "X"
+    upper_txt = txt.upper()
+    if "NONE" in upper_txt or "N/A" in upper_txt: return "NONE"
+    m = _축척_패턴.search(upper_txt)
+    if m and m.group(2): return f"1/{m.group(2)}"
+    return "X"
 
-# Scale cell values that should be treated as "no scale".
-_EMPTY_SCALE_TOKENS = {"", "NONE", "N/A", "N.A.", "-", "—", "–"}
-
-
-def _normalize_drawing_number(s: str) -> str:
-    """
-    Strip all internal whitespace from a drawing number so that
-    "AA - 401" and "AA-401" compare equal when merging PDF vs DWG rows.
-    """
-    if not s:
-        return ""
-    return re.sub(r"\s+", "", s)
-
+# V46 핵심: 도면명이 도면번호로 오인되는 것을 막는 지능형 추출 함수
+def _extract_drawing_number(text: str) -> Optional[str]:
+    for m in _도면번호_패턴.finditer(text):
+        prefix = m.group(1)
+        # 앞글자가 '도'(상세도)나 '표'(일람표)로 끝나면 도면번호가 아님!
+        if prefix.endswith("도") or prefix.endswith("표"): continue
+        if any(k in prefix for k in ["상세", "일람", "배치", "전개", "마감", "계획", "조감", "구조"]): continue
+        return m.group(0) # 유효한 도면번호만 반환
+    return None
 
 # ============================================================================
-# 1.  INTERACTIVE CLI PROMPTS
+# 1. PDF 데이터 추출
 # ============================================================================
-def _prompt_path(label: str, *, must_be_dir: bool = False,
-                 must_be_file: bool = False) -> str:
-    """Prompt the user for a filesystem path, expand it, and validate."""
-    while True:
-        raw = input(label).strip().strip('"').strip("'")
-        if not raw:
-            print("    ! Empty input. Please try again.")
-            continue
-        path = os.path.expanduser(os.path.expandvars(raw))
-        if must_be_dir and not os.path.isdir(path):
-            print(f"    ! Not a valid directory: {path}")
-            continue
-        if must_be_file and not os.path.isfile(path):
-            print(f"    ! Not a valid file: {path}")
-            continue
-        return os.path.abspath(path)
-
-
-def prompt_inputs() -> Tuple[str, str, str]:
-    """Collect TARGET_DIR, PDF_PATH and BLOCK_NAME from the user."""
-    print("=" * 72)
-    print(" PDF <-> CAD Drawing Cross-Check")
-    print("=" * 72)
-
-    target_dir = _prompt_path(
-        "Enter the full directory path that contains the DWG files: ",
-        must_be_dir=True,
-    )
-    pdf_path = _prompt_path(
-        "Enter the full path of the master PDF drawing list: ",
-        must_be_file=True,
-    )
-    block_name = input("Enter the Name of the Title Block to search for: ").strip()
-    if not block_name:
-        print("[ERROR] Title block name cannot be empty.")
-        sys.exit(1)
-
-    return target_dir, pdf_path, block_name
-
-
-# ============================================================================
-# 2.  PDF EXTRACTION  (strict line-based grid parser)
-# ============================================================================
-#
-# The master drawing list is a grid table with visible horizontal / vertical
-# borders, often split into a left half and a right half on the same page.
-# The parser therefore uses pdfplumber with the "lines" table strategy and
-# scans each extracted row left-to-right: every cell that looks like a
-# Drawing Number opens a new entry whose Name / Scale come from the next
-# non-empty cells in the same row (up to the next Drawing Number, so split
-# layouts are handled naturally).
-# ----------------------------------------------------------------------------
-
-def _debug_pdf_page(page) -> None:
-    """Print a raw-text snippet from a page so you can diagnose parsing."""
-    raw = page.extract_text() or ""
-    snippet = raw[:800]
-    print("[PDF ] -------- raw text snippet (page 1) --------")
-    for line in snippet.splitlines():
-        print(f"[PDF ]   {line}")
-    print("[PDF ] -------------------------------------------------")
-
-
-def _normalize_cell(cell) -> str:
-    """Trim a pdfplumber cell value; return '' for None and collapse newlines."""
-    if cell is None:
-        return ""
-    return " ".join(str(cell).split()).strip()
-
-
-def _parse_grid_row(row: list) -> List[dict]:
-    """
-    Parse one pdfplumber table row into zero or more drawing entries.
-
-    Walks the row left-to-right. Every cell that matches
-    _CELL_DRAWING_NO_RE opens a new entry; the entry's slice extends up
-    to (but excluding) the next drawing-number cell in the same row.
-    Within that slice:
-
-      * first non-empty cell  -> Drawing Name
-      * second non-empty cell -> Scale   (normalised: NONE / "-" / "" -> "")
-
-    This makes empty Scale cells harmless — they never cause column
-    shift, because we anchor on the Drawing Number position instead of
-    assuming a fixed column layout.
-    """
-    cells = [_normalize_cell(c) for c in (row or [])]
-    n = len(cells)
-    if n == 0:
-        return []
-
-    # Locate every drawing-number cell in the row.
-    positions: List[Tuple[int, str]] = []
-    for i, cell in enumerate(cells):
-        m = _CELL_DRAWING_NO_RE.match(cell)
-        if m:
-            letters, digits = m.groups()
-            positions.append((i, f"{letters}-{digits}"))
-
-    if not positions:
-        return []
-
-    results: List[dict] = []
-    for idx, (pos, dwg_no) in enumerate(positions):
-        end = positions[idx + 1][0] if idx + 1 < len(positions) else n
-        segment = cells[pos + 1:end]
-        non_empty = [c for c in segment if c]
-
-        name  = non_empty[0] if len(non_empty) >= 1 else ""
-        scale = non_empty[1] if len(non_empty) >= 2 else ""
-
-        # "NONE", "-", etc. should be treated as empty so the Excel
-        # mismatch highlight doesn't fire spuriously.
-        if scale.strip().upper() in _EMPTY_SCALE_TOKENS:
-            scale = ""
-
-        results.append({
-            "Drawing Number": dwg_no,
-            "Drawing Name":   name,
-            "Scale":          scale,
-        })
-
-    return results
-
-
 def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
-    """
-    Parse *pdf_path* assuming a strict line-bordered grid table and return
-    a DataFrame with columns ``Drawing Number``, ``Drawing Name``, ``Scale``.
-
-    Uses ``pdfplumber.Page.extract_tables`` with the "lines" strategy and
-    delegates per-row cell interpretation to :func:`_parse_grid_row`, which
-    handles split left/right layouts and empty / "NONE" scale cells.
-    """
-    print(f"[PDF ] Opening: {pdf_path}")
-    all_rows: List[dict] = []
-    debug_done = False
-
-    table_settings = {
-        "vertical_strategy":   "lines",
-        "horizontal_strategy": "lines",
-    }
-
+    print(f"[PDF ] 분석 시작: {os.path.basename(pdf_path)}")
+    데이터 = []
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            for page_no, page in enumerate(pdf.pages, 1):
-
-                if not debug_done:
-                    _debug_pdf_page(page)
-                    debug_done = True
-
-                before = len(all_rows)
-                tables = page.extract_tables(table_settings=table_settings) or []
-
-                for t_idx, table in enumerate(tables):
-                    if not table:
-                        continue
-                    for row in table:
-                        all_rows.extend(_parse_grid_row(row))
-
-                added = len(all_rows) - before
-                print(f"[PDF ] Page {page_no}: +{added} rows  "
-                      f"(tables: {len(tables)}, total {len(all_rows)})")
-
-    except FileNotFoundError:
-        print(f"[ERROR] PDF not found: {pdf_path}")
-        raise
-    except Exception as exc:
-        print(f"[ERROR] Failed to read PDF: {exc}")
-        raise
-
-    df = pd.DataFrame(all_rows, columns=["Drawing Number", "Drawing Name", "Scale"])
-    if not df.empty:
-        df = df.drop_duplicates(subset=["Drawing Number"]).reset_index(drop=True)
-
-    print(f"[PDF ] Extracted {len(df)} unique drawings")
-
-    # Debug: show the first 10 rows of the resulting DataFrame so the
-    # user can verify structure before anything is written to Excel.
-    print("[PDF ] -------- DataFrame preview  df.head(10) --------")
-    if df.empty:
-        print("[PDF ]   (empty DataFrame)")
-    else:
-        preview = df.head(10).to_string(index=False)
-        for line in preview.splitlines():
-            print(f"[PDF ]   {line}")
-    print("[PDF ] ----------------------------------------------------")
-
-    return df
-
+            for page in pdf.pages:
+                width, height = page.width, page.height
+                경계선 = width * 0.465
+                for 범위 in [(0, 0, mid := width * 0.465, height), (mid, 0, width, height)]:
+                    영역 = page.crop(범위)
+                    텍스트 = 영역.extract_text()
+                    if not 텍스트: continue
+                    for 줄 in 텍스트.splitlines():
+                        줄 = re.sub(r"(\d)(1\s?[/:,])", r"\1 \2", 줄)
+                        
+                        # V46 안전한 도면번호 추출 적용
+                        raw_no = _extract_drawing_number(줄)
+                        if not raw_no: continue
+                        번호 = _도면번호_세척(raw_no)
+                        남은텍스트 = 줄.replace(raw_no, "").strip()
+                        
+                        found_scales = []
+                        for token in 남은텍스트.split():
+                            if "NONE" in token.upper() or "N/A" in token.upper():
+                                found_scales.append("NONE")
+                            else:
+                                sm = _축척_패턴.search(token)
+                                if sm: found_scales.append(f"1/{sm.group(2)}")
+                                
+                        a1 = found_scales[0] if len(found_scales) >= 1 else "X"
+                        a3 = found_scales[1] if len(found_scales) >= 2 else "X"
+                        
+                        명칭 = 남은텍스트
+                        for s in found_scales:
+                            if s != "NONE": 명칭 = re.sub(rf"1\s?[/:,]\s?{s[2:]}", "", 명칭)
+                        명칭 = 명칭.replace("NONE", "").replace("N/A", "").strip().strip(",").strip()
+                        if 번호:
+                            데이터.append({"도면번호(PDF)": 번호, "도면명(PDF)": 명칭, "축척_A1(PDF)": a1, "축척_A3(PDF)": a3})
+                print(f"[PDF ] {page.page_number}페이지 분석 완료")
+    except Exception as e: print(f"[ERROR] PDF 읽기 실패: {e}")
+    df = pd.DataFrame(데이터)
+    return df.drop_duplicates(subset=["도면번호(PDF)"]).reset_index(drop=True) if not df.empty else df
 
 # ============================================================================
-# 3.  DWG / DXF EXTRACTION  (Model Space only)
+# 2. CAD 데이터 추출
 # ============================================================================
+def _oda_환경_설정():
+    from ezdxf.addons import odafc
+    설치경로 = ""
+    for 경로 in [r"C:\Program Files\ODA", r"C:\Program Files (x86)\ODA"]:
+        실행파일들 = glob.glob(os.path.join(경로, "*", "ODAFileConverter.exe"))
+        if 실행파일들: 설치경로 = sorted(실행파일들, reverse=True)[0]; break
+    if 설치경로:
+        폴더경로 = os.path.dirname(설치경로)
+        if 폴더경로 not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = 폴더경로 + os.pathsep + os.environ.get("PATH", "")
+        try: ezdxf.options.set("odafc", "win_exec_path", 설치경로)
+        except: pass
+    return 설치경로
 
-# --- ODA File Converter configuration ---------------------------------------
-_odafc_configured: bool = False
-_oda_resolved_path: str = ""   # populated by _resolve_oda_path()
+def _cad_문서_로드(path: Path):
+    확장자 = path.suffix.lower()
+    if 확장자 == ".dxf": return ezdxf.readfile(str(path))
+    _oda_환경_설정()
+    from ezdxf.addons import odafc
+    return odafc.readfile(str(path))
 
-# Standard install roots searched during auto-detection.
-_ODA_SEARCH_ROOTS: Tuple[str, ...] = (
-    r"C:\Program Files\ODA",
-    r"C:\Program Files (x86)\ODA",
-)
-# Executable filenames (case variants — NTFS is case-insensitive but the
-# glob itself on other platforms is not).
-_ODA_EXE_NAMES: Tuple[str, ...] = (
-    "ODAFileConverter.exe",
-    "OdaFileConverter.exe",
-)
-
-
-def _autodetect_oda_path() -> str:
-    """
-    Walk the common ODA install roots and return the full path to
-    OdaFileConverter.exe (preferring the newest version folder). Returns
-    an empty string if nothing is found.
-    """
-    candidates: List[str] = []
-    for root in _ODA_SEARCH_ROOTS:
-        if not os.path.isdir(root):
-            continue
-        for exe in _ODA_EXE_NAMES:
-            # Typical layout: <root>\ODAFileConverter <version>\<exe>
-            candidates.extend(glob.glob(os.path.join(root, "*", exe)))
-            # Also accept the executable placed directly in <root>\<exe>
-            candidates.extend(glob.glob(os.path.join(root, exe)))
-
-    # De-duplicate and pick the lexicographically-highest match — for a
-    # folder like "ODAFileConverter 27.1.0" this naturally prefers the
-    # most recent version.
-    candidates = sorted({os.path.normpath(c) for c in candidates}, reverse=True)
-
-    for c in candidates:
-        if os.path.isfile(c):
-            return c
-    return ""
-
-
-def _canonical_path(p: str) -> str:
-    """
-    Aggressively normalise a filesystem path:
-      * expand ~ and $VARS
-      * Path.resolve() to get an absolute, symlink-free form
-      * os.path.normpath() to collapse slashes / separators
-    Produces Windows-style backslashes on Windows and forward slashes on POSIX.
-    """
-    if not p:
-        return ""
-    expanded = os.path.expanduser(os.path.expandvars(p))
+def _텍스트_데이터_추출(ent) -> Optional[Tuple[float, float, str]]:
+    유형 = ent.dxftype()
     try:
-        resolved = str(Path(expanded).resolve())
-    except Exception:
-        resolved = os.path.abspath(expanded)
-    return os.path.normpath(resolved)
-
-
-def _resolve_oda_path() -> str:
-    """
-    Decide which OdaFileConverter.exe to use, in order of preference:
-
-      1. Honour ODA_PATH if the user set it manually at the top of this file.
-      2. Auto-detect inside the standard Windows install roots.
-      3. Fall back to interactive input().
-
-    Every returned path is pushed through :func:`_canonical_path` so the
-    final value is absolute, normalised, and free of mixed slashes.
-    The final value is cached in ``_oda_resolved_path`` and returned.
-    """
-    global _oda_resolved_path
-
-    # Hardcoded override wins.
-    if ODA_PATH and os.path.isfile(ODA_PATH):
-        _oda_resolved_path = _canonical_path(ODA_PATH)
-        return _oda_resolved_path
-    if ODA_PATH and not os.path.isfile(ODA_PATH):
-        print(f"[WARN] ODA_PATH is set but not a valid file: {ODA_PATH}")
-
-    # Auto-detect.
-    found = _autodetect_oda_path()
-    if found:
-        found = _canonical_path(found)
-        print(f"[INFO] Auto-detected ODA Converter at: {found}")
-        _oda_resolved_path = found
-        return _oda_resolved_path
-
-    # Fallback: prompt the user.
-    print("[WARN] Could not auto-detect OdaFileConverter.exe in the standard")
-    print("       install roots:")
-    for r in _ODA_SEARCH_ROOTS:
-        print(f"           {r}")
-    while True:
-        raw = input("Enter the exact file path for OdaFileConverter.exe: ").strip().strip('"').strip("'")
-        if not raw:
-            print("    ! Empty input. Please try again.")
-            continue
-        path = _canonical_path(raw)
-        if not os.path.isfile(path):
-            print(f"    ! Not a valid file: {path}")
-            continue
-        _oda_resolved_path = path
-        return _oda_resolved_path
-
-
-def _configure_odafc() -> None:
-    """
-    Resolve the OdaFileConverter executable path and push it into ezdxf's
-    ``odafc`` addon so subsequent DWG opens succeed. Called lazily (from
-    ``_load_doc``) on the first DWG file encountered.
-
-    Order of operations is deliberate — PATH injection happens BEFORE any
-    ezdxf attribute is touched, because the documented odafc code path in
-    ezdxf 1.x validates the binary with ``shutil.which()`` during the very
-    first attribute access / readfile() call:
-
-      1. Canonicalise the resolved path with pathlib + os.path.normpath so
-         Windows slashes / case / trailing whitespace are consistent.
-      2. Prepend the binary's directory to ``os.environ["PATH"]`` so
-         subsequent ``shutil.which("ODAFileConverter")`` calls resolve to
-         the right file regardless of what ezdxf does internally. This
-         is the "final-boss" workaround for the "Could not find
-         ODAFileConverter in the path" error.
-      3. Set ``ezdxf.addons.odafc.configs.odafc_exec_path`` if that
-         submodule is present in the installed ezdxf variant.
-      4. Set ``ezdxf.addons.odafc.win_exec_path`` (or ``unix_exec_path``)
-         to the canonical path — documented ezdxf 1.x API.
-      5. Verify the configuration with ``shutil.which()`` and print a
-         diagnostic showing both the quoted and unquoted forms so the
-         user can sanity-check them manually if something still fails.
-    """
-    global _odafc_configured
-    if _odafc_configured:
-        return
-
-    raw_path = _resolve_oda_path()
-    if not raw_path:
-        _odafc_configured = True
-        return
-
-    # --- (1) canonicalise -------------------------------------------------
-    path = _canonical_path(raw_path)
-    if not os.path.isfile(path):
-        print(f"[WARN] ODA Converter path is not a file: {path}")
-        _odafc_configured = True
-        return
-
-    quoted_form = f'"{path}"'  # useful when a user pastes the path in cmd.exe
-    print(f"[INFO] Canonical ODA path   : {path}")
-    print(f"[INFO] Force-quoted variant : {quoted_form}")
-
-    # --- (2) PATH injection (BEFORE touching ezdxf!) ----------------------
-    exe_dir = os.path.dirname(path)
-    if exe_dir and os.path.isdir(exe_dir):
-        current_path = os.environ.get("PATH", "")
-        path_parts = current_path.split(os.pathsep) if current_path else []
-        if exe_dir not in path_parts:
-            os.environ["PATH"] = exe_dir + os.pathsep + current_path
-            print(f"[INFO] Injected ODA directory into PATH: {exe_dir}")
-        else:
-            print(f"[INFO] ODA directory already on PATH: {exe_dir}")
-
-    # --- (3) configs submodule (silent no-op if not present) --------------
-    try:
-        import ezdxf.addons.odafc.configs as odafc_configs  # type: ignore
-        odafc_configs.odafc_exec_path = path
-    except Exception:
-        pass
-
-    # --- (4) documented module-level attribute API ------------------------
-    try:
-        from ezdxf.addons import odafc
-        if sys.platform == "win32":
-            odafc.win_exec_path = path
-        else:
-            odafc.unix_exec_path = path
-    except Exception as exc:
-        print(f"[WARN] Could not set ezdxf odafc exec path: {exc}")
-
-    # --- (5) verify with shutil.which() -----------------------------------
-    import shutil
-    candidates = ("ODAFileConverter", "OdaFileConverter",
-                  "ODAFileConverter.exe", "OdaFileConverter.exe")
-    which_hit = None
-    for cand in candidates:
-        found = shutil.which(cand)
-        if found:
-            which_hit = (cand, found)
-            break
-    if which_hit:
-        print(f"[INFO] shutil.which({which_hit[0]!r}) -> {which_hit[1]}")
-    else:
-        # Last-ditch: try the absolute path itself.
-        direct = shutil.which(path)
-        if direct:
-            print(f"[INFO] shutil.which(<abs path>) -> {direct}")
-        else:
-            print("[WARN] shutil.which() still cannot locate the converter.")
-            print(f"       PATH[0] = {os.environ['PATH'].split(os.pathsep)[0]}")
-            print("       Try running the quoted form above manually in cmd.exe")
-            print("       to confirm the file is executable.")
-
-    _odafc_configured = True
-
-
-def _load_doc(path: Path):
-    """Load a DXF natively or a DWG via the ODA File Converter addon."""
-    suffix = path.suffix.lower()
-
-    if suffix == ".dxf":
-        try:
-            return ezdxf.readfile(str(path))
-        except Exception as exc:
-            raise RuntimeError(f"ezdxf could not read {path.name}: {exc}") from exc
-
-    if suffix == ".dwg":
-        _configure_odafc()
-        shown_path = _oda_resolved_path or ODA_PATH or "<system PATH>"
-        try:
-            from ezdxf.addons import odafc
-            return odafc.readfile(str(path))
-        except FileNotFoundError as exc:
-            raise RuntimeError(
-                f"ODA Converter not found at [{shown_path}] "
-                f"(underlying error: {exc})"
-            ) from exc
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "odafileconverter" in msg or "oda_file_converter" in msg \
-               or "no such file" in msg or "cannot find" in msg:
-                raise RuntimeError(
-                    f"ODA Converter not found at [{shown_path}] "
-                    f"(underlying error: {exc})"
-                ) from exc
-            raise RuntimeError(
-                f"odafc failed to read {path.name}: {exc}"
-            ) from exc
-
-    raise ValueError(f"Unsupported CAD file extension: {suffix}")
-
-
-def _entity_point(ent) -> Optional[Tuple[float, float]]:
-    """Return a representative (x, y) insertion point for TEXT / MTEXT."""
-    t = ent.dxftype()
-    try:
-        if t == "TEXT":
-            if getattr(ent.dxf, "halign", 0) or getattr(ent.dxf, "valign", 0):
-                p = ent.dxf.align_point
-            else:
-                p = ent.dxf.insert
-            return (float(p[0]), float(p[1]))
-        if t == "MTEXT":
-            p = ent.dxf.insert
-            return (float(p[0]), float(p[1]))
-    except Exception:
-        return None
+        if 유형 == "TEXT":
+            p = ent.dxf.align_point if getattr(ent.dxf, "halign", 0) or getattr(ent.dxf, "valign", 0) else ent.dxf.insert
+            return (float(p[0]), float(p[1]), (ent.dxf.text or "").strip())
+        if 유형 == "MTEXT":
+            return (float(ent.dxf.insert[0]), float(ent.dxf.insert[1]), ent.plain_text().strip())
+    except Exception: return None
     return None
 
+def extract_dwg_data(target_dir: str, block_name: str, base_w: float, base_h: float) -> pd.DataFrame:
+    목표블록 = block_name.strip().lower()
+    데이터 = []
+    캐드파일들 = sorted(set(glob.glob(os.path.join(target_dir, "*.dwg")) + glob.glob(os.path.join(target_dir, "*.dxf"))))
 
-def _entity_text(ent) -> str:
-    """Return the plain text content of a TEXT / MTEXT entity."""
-    t = ent.dxftype()
-    try:
-        if t == "TEXT":
-            return (ent.dxf.text or "").strip()
-        if t == "MTEXT":
-            return ent.plain_text().strip()
-    except Exception:
-        return ""
-    return ""
+    for i, 전체경로 in enumerate(캐드파일들, 1):
+        파일명 = os.path.basename(전체경로)
+        print(f"[CAD ] ({i}/{len(캐드파일들)}) {파일명:<30}", end=" | ", flush=True)
+        try:
+            doc = _cad_문서_로드(Path(전체경로))
+            msp = doc.modelspace()
+            도곽들 = [ins for ins in msp.query("INSERT") if 목표블록 in ins.dxf.name.lower()]
+            if not 도곽들: print("도곽 없음."); continue
 
+            모든텍스트 = []
+            for ent in msp.query("TEXT MTEXT"):
+                d = _텍스트_데이터_추출(ent)
+                if d and d[2]: 모든텍스트.append(d)
 
-def _compute_insert_bbox(insert):
-    """Return the bounding box of an INSERT or None if unavailable."""
-    try:
-        box = bbox.extents([insert])
-        if box.has_data:
-            return box
-    except Exception:
-        pass
-    return None
+            추출개수 = 0
+            for idx, 도곽 in enumerate(도곽들, 1):
+                ix, iy = 도곽.dxf.insert.x, 도곽.dxf.insert.y
+                xscale, yscale = abs(도곽.dxf.xscale), abs(도곽.dxf.yscale)
+                너비, 높이 = base_w * xscale, base_h * yscale
+                x_min, x_max = ix + (너비 * X_MIN_RATIO), ix + (너비 * X_MAX_RATIO)
+                y_min, y_max = iy + (높이 * Y_MIN_RATIO), iy + (높이 * Y_MAX_RATIO)
 
+                박스텍스트 = [t for t in 모든텍스트 if x_min <= t[0] <= x_max and y_min <= t[1] <= y_max]
+                if 박스텍스트:
+                    
+                    labels_a1 = [t for t in 박스텍스트 if re.search(r"\bA1\b", t[2].upper())]
+                    labels_a3 = [t for t in 박스텍스트 if re.search(r"\bA3\b", t[2].upper())]
+                    scales = [t for t in 박스텍스트 if _축척_패턴.search(t[2].upper())]
+                    
+                    a1, a3 = "X", "X"
+                    
+                    if labels_a1 and scales:
+                        a1_y = labels_a1[0][1]
+                        closest_to_a1 = min(scales, key=lambda s: abs(s[1] - a1_y))
+                        if abs(closest_to_a1[1] - a1_y) < (높이 * 0.05):
+                            a1 = _축척_텍스트_정리(closest_to_a1[2])
+                            scales.remove(closest_to_a1)
 
-def _looks_like_drawing_number(text: str) -> bool:
-    """True if *text* (after squashing whitespace) looks like a drawing number."""
-    squashed = re.sub(r"\s+", "", text)
-    return bool(
-        _DRAWING_NUMBER_RE.match(squashed)
-        and any(ch.isdigit() for ch in squashed)
-    )
+                    if labels_a3 and scales:
+                        a3_y = labels_a3[0][1]
+                        closest_to_a3 = min(scales, key=lambda s: abs(s[1] - a3_y))
+                        if abs(closest_to_a3[1] - a3_y) < (높이 * 0.05):
+                            a3 = _축척_텍스트_정리(closest_to_a3[2])
+                            
+                    if a1 == "X" and a3 == "X" and scales:
+                        scales.sort(key=lambda x: -x[1])
+                        if len(scales) >= 1: a1 = _축척_텍스트_정리(scales[0][2])
+                        if len(scales) >= 2: a3 = _축척_텍스트_정리(scales[1][2])
 
+                    박스텍스트.sort(key=lambda x: -x[1])
+                    줄목록 = []
+                    현재_줄, 현재_y = [], None
+                    for tx, ty, txt in 박스텍스트:
+                        if 현재_y is None: 현재_y = ty; 현재_줄.append((tx, txt))
+                        elif abs(현재_y - ty) < (높이 * 0.015): 현재_줄.append((tx, txt))
+                        else:
+                            현재_줄.sort(key=lambda x: x[0]); 줄목록.append(" ".join([x[1] for x in 현재_줄]))
+                            현재_y = ty; 현재_줄 = [(tx, txt)]
+                    if 현재_줄: 현재_줄.sort(key=lambda x: x[0]); 줄목록.append(" ".join([x[1] for x in 현재_줄]))
 
-def _pair_number_and_name(
-    hits: List[Tuple[float, float, str]],
-) -> Tuple[str, str]:
-    """
-    From texts inside the search rectangle, identify Drawing Number and Name.
+                    번호, 명칭 = "", ""
+                    명칭후보 = []
+                    for 줄 in 줄목록:
+                        # V46 안전한 도면번호 추출 적용
+                        raw_no = _extract_drawing_number(줄)
+                        if raw_no and not 번호: 번호 = _도면번호_세척(raw_no)
+                        
+                        clean = 줄.replace(raw_no if raw_no else "", "").strip()
+                        clean = re.sub(r"\bA1\b|\bA3\b|NONE|N/A", "", clean, flags=re.IGNORECASE)
+                        clean = re.sub(r"1\s?[/:,]\s?\d{1,4}", "", clean, flags=re.IGNORECASE)
+                        clean = clean.strip().strip(",")
+                        
+                        if len(clean) > 2 and "도면명" not in clean and "SCALE" not in clean.upper():
+                            명칭후보.append(clean)
+                    if 명칭후보: 명칭 = max(명칭후보, key=lambda s: len(s.replace(" ", "")))
 
-    The Drawing Number is normalised via _normalize_drawing_number() so that
-    "AA - 401" in a DWG and "AA-401" in the PDF merge onto the same row.
-    """
-    if not hits:
-        return "", ""
-
-    numbers: List[Tuple[float, float, str]] = []
-    others:  List[Tuple[float, float, str]] = []
-    for x, y, text in hits:
-        if _looks_like_drawing_number(text):
-            numbers.append((x, y, text))
-        else:
-            others.append((x, y, text))
-
-    if numbers and others:
-        numbers.sort(key=lambda h: -h[1])
-        others.sort(key=lambda h: -h[1])
-        return _normalize_drawing_number(numbers[0][2]), others[0][2]
-
-    hits_sorted = sorted(hits, key=lambda h: -h[1])
-    if len(hits_sorted) >= 2:
-        return _normalize_drawing_number(hits_sorted[0][2]), hits_sorted[1][2]
-    return _normalize_drawing_number(hits_sorted[0][2]), ""
-
-
-def extract_dwg_data(target_dir: str, block_name: str) -> pd.DataFrame:
-    """
-    Walk *target_dir* and extract Drawing Number / Drawing Name from every
-    INSERT matching *block_name* in the host Model Space.
-    """
-    target_block = block_name.strip().lower()
-    rows: List[dict] = []
-
-    cad_files: List[str] = []
-    for pat in ("*.dwg", "*.DWG", "*.dxf", "*.DXF"):
-        cad_files.extend(glob.glob(os.path.join(target_dir, pat)))
-    cad_files = sorted(set(cad_files))
-
-    empty = pd.DataFrame(columns=["Source File", "Drawing Number", "Drawing Name"])
-    if not cad_files:
-        print(f"[WARN] No .dwg / .dxf files found in {target_dir}")
-        return empty
-
-    prev_cwd = os.getcwd()
-    try:
-        os.chdir(target_dir)
-        print(f"[CAD ] Working directory : {os.getcwd()}")
-        print(f"[CAD ] Files discovered  : {len(cad_files)}")
-
-        for idx, full_path in enumerate(cad_files, 1):
-            fname = os.path.basename(full_path)
-            print(f"[CAD ] ({idx}/{len(cad_files)}) Processing {fname} ...",
-                  end=" ", flush=True)
-
-            try:
-                doc = _load_doc(Path(fname))
-            except Exception as exc:
-                print(f"FAILED to open ({exc})")
-                continue
-
-            try:
-                msp = doc.modelspace()
-                tb_inserts = [
-                    ins for ins in msp.query("INSERT")
-                    if ins.dxf.name.strip().lower() == target_block
-                ]
-                if not tb_inserts:
-                    print(f"no '{block_name}' in model space")
-                    continue
-
-                text_entities = list(msp.query("TEXT MTEXT"))
-                file_rows = 0
-
-                for tb in tb_inserts:
-                    box = _compute_insert_bbox(tb)
-                    if box is None:
-                        continue  # unresolved xref — skip
-
-                    min_x = float(box.extmin.x)
-                    min_y = float(box.extmin.y)
-                    max_x = float(box.extmax.x)
-                    max_y = float(box.extmax.y)
-                    width  = max_x - min_x
-                    height = max_y - min_y
-                    if width <= 0 or height <= 0:
-                        continue
-
-                    sx_max = max_x
-                    sx_min = max_x - width  * X_RATIO
-                    sy_min = min_y
-                    sy_max = min_y + height * Y_RATIO
-
-                    hits: List[Tuple[float, float, str]] = []
-                    for ent in text_entities:
-                        pt = _entity_point(ent)
-                        if pt is None:
-                            continue
-                        x, y = pt
-                        if sx_min <= x <= sx_max and sy_min <= y <= sy_max:
-                            content = _entity_text(ent)
-                            if content:
-                                hits.append((x, y, content))
-
-                    if not hits:
-                        continue
-
-                    dwg_no, dwg_name = _pair_number_and_name(hits)
-                    if dwg_no or dwg_name:
-                        rows.append({
-                            "Source File":    fname,
-                            "Drawing Number": dwg_no,
-                            "Drawing Name":   dwg_name,
-                        })
-                        file_rows += 1
-
-                print(f"Done ({file_rows} drawings, "
-                      f"{len(tb_inserts)} title-block instance(s))")
-
-            except Exception as exc:
-                print(f"FAILED (unexpected error: {exc})")
-                traceback.print_exc()
-
-    finally:
-        os.chdir(prev_cwd)
-
-    df = pd.DataFrame(rows, columns=["Source File", "Drawing Number", "Drawing Name"])
-    if not df.empty:
-        df = (
-            df[df["Drawing Number"] != ""]
-            .drop_duplicates(subset=["Drawing Number"])
-            .reset_index(drop=True)
-        )
-    print(f"[CAD ] Total unique drawings extracted: {len(df)}")
-    return df
-
+                    if DEBUG: print(f"    [DBG] 도곽 #{idx} 확정 결과: A1={a1}, A3={a3}, 번호={번호}, 명칭={명칭}")
+                    if 번호:
+                        데이터.append({"파일명": 파일명, "도면번호(DWG)": 번호, "도면명(DWG)": 명칭, "축척_A1(DWG)": a1, "축척_A3(DWG)": a3})
+                        추출개수 += 1
+            print(f"성공 ({추출개수}/{len(도곽들)})")
+        except Exception as e: print(f"오류: {e}")
+    return pd.DataFrame(데이터) if 데이터 else pd.DataFrame(columns=["파일명", "도면번호(DWG)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)"])
 
 # ============================================================================
-# 4.  COMPARE & WRITE EXCEL REPORT
+# 3. 리포트 생성 및 메인
 # ============================================================================
-def build_report(pdf_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str) -> None:
-    """Outer-merge on Drawing Number and write a highlighted report.xlsx."""
-    pdf = pdf_df.rename(columns={
-        "Drawing Name": "Drawing Name (PDF)",
-        "Scale":        "Scale (PDF)",
-    })
-    dwg = dwg_df.rename(columns={
-        "Drawing Name": "Drawing Name (DWG)",
-    })
-
-    merged = pdf.merge(dwg, on="Drawing Number", how="outer", indicator=True)
-
-    for col in ["Drawing Name (PDF)", "Drawing Name (DWG)", "Scale (PDF)", "Source File"]:
-        if col not in merged.columns:
-            merged[col] = ""
-
-    merged["Match Status"] = merged["_merge"].map({
-        "both":       "MATCHED",
-        "left_only":  "DWG MISSING",
-        "right_only": "PDF MISSING",
-    })
-    merged = merged[[
-        "Drawing Number",
-        "Drawing Name (PDF)",
-        "Drawing Name (DWG)",
-        "Scale (PDF)",
-        "Source File",
-        "Match Status",
-    ]].fillna("")
-
-    merged.to_excel(out_path, index=False)
-
-    red = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
-    wb  = load_workbook(out_path)
-    ws  = wb.active
-
-    h    = {cell.value: cell.column for cell in ws[1]}
-    c_no = h["Drawing Number"]
-    c_np = h["Drawing Name (PDF)"]
-    c_nd = h["Drawing Name (DWG)"]
-    c_sc = h["Scale (PDF)"]
-    c_st = h["Match Status"]
-
+def build_report(pdf_df: pd.DataFrame, dwg_df: pd.DataFrame, out_path: str):
+    pdf, dwg = pdf_df.copy(), dwg_df.copy()
+    pdf["KEY"] = pdf["도면번호(PDF)"].str.replace(" ", "") if "도면번호(PDF)" in pdf.columns else ""
+    dwg["KEY"] = dwg["도면번호(DWG)"].str.replace(" ", "") if "도면번호(DWG)" in dwg.columns else ""
+    결과 = pd.merge(pdf, dwg, on="KEY", how="outer", indicator=True)
+    결과["상태"] = 결과["_merge"].map({"both": "일치", "left_only": "DWG 누락", "right_only": "PDF 누락"})
+    정리할_컬럼 = ["도면번호(PDF)", "도면명(PDF)", "축척_A1(PDF)", "축척_A3(PDF)", "도면번호(DWG)", "도면명(DWG)", "축척_A1(DWG)", "축척_A3(DWG)", "파일명", "상태"]
+    for c in 정리할_컬럼:
+        if c not in 결과.columns: 결과[c] = ""
+    결과 = 결과[정리할_컬럼].fillna("X")
+    결과.to_excel(out_path, index=False)
+    
+    빨간색 = PatternFill(start_color="FFFF9999", end_color="FFFF9999", fill_type="solid")
+    wb = load_workbook(out_path); ws = wb.active
+    h = {cell.value: cell.column for cell in ws[1]}
     for row in range(2, ws.max_row + 1):
-        status   = ws.cell(row=row, column=c_st).value or ""
-        name_pdf = (ws.cell(row=row, column=c_np).value or "").strip()
-        name_dwg = (ws.cell(row=row, column=c_nd).value or "").strip()
-        scale    = (ws.cell(row=row, column=c_sc).value or "").strip()
-
-        if status in ("DWG MISSING", "PDF MISSING"):
-            for c in (c_no, c_np, c_nd, c_sc, c_st):
-                ws.cell(row=row, column=c).fill = red
+        상태 = ws.cell(row=row, column=h.get("상태", 1)).value
+        if 상태 != "일치":
+            for c in h.values(): ws.cell(row=row, column=c).fill = 빨간색
             continue
-
-        if name_pdf.lower() != name_dwg.lower():
-            ws.cell(row=row, column=c_np).fill = red
-            ws.cell(row=row, column=c_nd).fill = red
-
-        if scale == "":
-            ws.cell(row=row, column=c_sc).fill = red
-
+        if str(ws.cell(row=row, column=h.get("도면번호(PDF)")).value).replace(" ","") != str(ws.cell(row=row, column=h.get("도면번호(DWG)")).value).replace(" ",""):
+            ws.cell(row=row, column=h.get("도면번호(PDF)")).fill = 빨간색; ws.cell(row=row, column=h.get("도면번호(DWG)")).fill = 빨간색
+        for s in ["A1", "A3"]:
+            p_val = str(ws.cell(row=row, column=h.get(f"축척_{s}(PDF)")).value).replace(" ","")
+            d_val = str(ws.cell(row=row, column=h.get(f"축척_{s}(DWG)")).value).replace(" ","")
+            if p_val != d_val:
+                ws.cell(row=row, column=h.get(f"축척_{s}(PDF)")).fill = 빨간색; ws.cell(row=row, column=h.get(f"축척_{s}(DWG)")).fill = 빨간색
     wb.save(out_path)
-    print(f"[XLSX] Report saved: {out_path}")
+    print(f"[XLSX] 리포트 저장 완료: {out_path}")
 
-
-# ============================================================================
-# 5.  MAIN
-# ============================================================================
-def main() -> None:
-    target_dir, pdf_path, block_name = prompt_inputs()
-
-    print("-" * 72)
-    print(f"[INFO] Target dir : {target_dir}")
-    print(f"[INFO] PDF path   : {pdf_path}")
-    print(f"[INFO] Block name : {block_name}")
-    print("-" * 72)
-
-    # Resolve & configure the ODA File Converter eagerly, but only when the
-    # target directory actually contains .dwg files — avoids prompting the
-    # user for a converter path they do not need.
-    dwg_hits = (
-        glob.glob(os.path.join(target_dir, "*.dwg"))
-        + glob.glob(os.path.join(target_dir, "*.DWG"))
-    )
-    if dwg_hits:
-        _configure_odafc()
-
-    out_path = os.path.abspath(REPORT_NAME)
-
+def main():
+    print("=" * 72); print(" PDF <-> CAD 체크 V46 (도면명 절삭 방지 및 축척 완벽 적용)"); print("=" * 72)
+    캐드경로 = input("1. DWG 폴더 경로: ").strip().strip('"')
+    PDF경로 = input("2. PDF 파일 경로: ").strip().strip('"')
+    블록이름 = input("3. 도곽 블록 이름: ").strip()
     try:
-        pdf_df = extract_pdf_table(pdf_path)
-    except Exception as exc:
-        print(f"[FATAL] PDF extraction aborted: {exc}")
-        sys.exit(1)
-
-    try:
-        dwg_df = extract_dwg_data(target_dir, block_name)
-    except Exception as exc:
-        print(f"[FATAL] DWG extraction aborted: {exc}")
-        traceback.print_exc()
-        sys.exit(1)
-
-    if pdf_df.empty and dwg_df.empty:
-        print("[ERROR] Both datasets are empty. Nothing to compare.")
-        sys.exit(1)
-
-    try:
-        build_report(pdf_df, dwg_df, out_path)
-    except Exception as exc:
-        print(f"[FATAL] Report generation failed: {exc}")
-        traceback.print_exc()
-        sys.exit(1)
-
-    print("-" * 72)
-    print("[DONE] All tasks completed successfully.")
-
+        base_w = float(input("4. 해당 도곽 원본의 가로 길이를 입력하세요 (예: 841): ").strip())
+        base_h = float(input("5. 해당 도곽 원본의 세로 길이를 입력하세요 (예: 594): ").strip())
+    except: base_w, base_h = 841.0, 594.0
+    pdf_데이터 = extract_pdf_table(PDF경로)
+    dwg_데이터 = extract_dwg_data(캐드경로, 블록이름, base_w, base_h)
+    build_report(pdf_데이터, dwg_데이터, os.path.abspath(리포트_이름))
+    print("-" * 72); print("[DONE] 작업이 완료되었습니다.")
 
 if __name__ == "__main__":
     main()
