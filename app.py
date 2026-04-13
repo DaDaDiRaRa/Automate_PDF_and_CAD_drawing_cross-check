@@ -450,12 +450,18 @@ def _configure_odafc() -> None:
     ``odafc`` addon so subsequent DWG opens succeed. Called lazily (from
     ``_load_doc``) on the first DWG file encountered.
 
-    Two configuration APIs are attempted so the setting works across ezdxf
-    versions:
+    Three things are done in order so the setting sticks across every
+    ezdxf variant we have seen in the wild:
 
-      1. ``ezdxf.addons.odafc.configs.odafc_exec_path``  (configs submodule)
+      1. ``ezdxf.addons.odafc.configs.odafc_exec_path``  (configs submodule
+         — present in some forks, silently ignored if missing)
       2. ``ezdxf.addons.odafc.win_exec_path`` /
          ``ezdxf.addons.odafc.unix_exec_path``            (documented in 1.x)
+      3. Inject the binary's directory into ``os.environ["PATH"]`` so that
+         the ``shutil.which()`` lookup inside ezdxf finds the executable
+         even when the above two attributes are ignored. This is the
+         actual workaround — several ezdxf releases hard-check PATH via
+         shutil.which() before honouring the configured exec_path.
     """
     global _odafc_configured
     if _odafc_configured:
@@ -483,6 +489,19 @@ def _configure_odafc() -> None:
             odafc.unix_exec_path = path
     except Exception as exc:
         print(f"[WARN] Could not set ezdxf odafc exec path: {exc}")
+
+    # --- (3) inject the binary's directory into os.environ["PATH"] ---------
+    # This is the real workaround: ezdxf's odafc helper calls shutil.which()
+    # under the hood, which only consults the PATH environment variable. By
+    # prepending the folder that contains OdaFileConverter.exe we guarantee
+    # shutil.which() returns a hit regardless of which ezdxf release is used.
+    exe_dir = os.path.dirname(path)
+    if exe_dir:
+        current_path = os.environ.get("PATH", "")
+        path_parts = current_path.split(os.pathsep) if current_path else []
+        if exe_dir not in path_parts:
+            os.environ["PATH"] = exe_dir + os.pathsep + current_path
+            print(f"[INFO] Injected ODA directory into PATH: {exe_dir}")
 
     _odafc_configured = True
 
