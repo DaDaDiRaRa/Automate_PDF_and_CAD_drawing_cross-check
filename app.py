@@ -340,6 +340,24 @@ def _autodetect_oda_path() -> str:
     return ""
 
 
+def _canonical_path(p: str) -> str:
+    """
+    Aggressively normalise a filesystem path:
+      * expand ~ and $VARS
+      * Path.resolve() to get an absolute, symlink-free form
+      * os.path.normpath() to collapse slashes / separators
+    Produces Windows-style backslashes on Windows and forward slashes on POSIX.
+    """
+    if not p:
+        return ""
+    expanded = os.path.expanduser(os.path.expandvars(p))
+    try:
+        resolved = str(Path(expanded).resolve())
+    except Exception:
+        resolved = os.path.abspath(expanded)
+    return os.path.normpath(resolved)
+
+
 def _resolve_oda_path() -> str:
     """
     Decide which OdaFileConverter.exe to use, in order of preference:
@@ -348,13 +366,15 @@ def _resolve_oda_path() -> str:
       2. Auto-detect inside the standard Windows install roots.
       3. Fall back to interactive input().
 
+    Every returned path is pushed through :func:`_canonical_path` so the
+    final value is absolute, normalised, and free of mixed slashes.
     The final value is cached in ``_oda_resolved_path`` and returned.
     """
     global _oda_resolved_path
 
     # Hardcoded override wins.
     if ODA_PATH and os.path.isfile(ODA_PATH):
-        _oda_resolved_path = ODA_PATH
+        _oda_resolved_path = _canonical_path(ODA_PATH)
         return _oda_resolved_path
     if ODA_PATH and not os.path.isfile(ODA_PATH):
         print(f"[WARN] ODA_PATH is set but not a valid file: {ODA_PATH}")
@@ -362,6 +382,7 @@ def _resolve_oda_path() -> str:
     # Auto-detect.
     found = _autodetect_oda_path()
     if found:
+        found = _canonical_path(found)
         print(f"[INFO] Auto-detected ODA Converter at: {found}")
         _oda_resolved_path = found
         return _oda_resolved_path
@@ -376,11 +397,11 @@ def _resolve_oda_path() -> str:
         if not raw:
             print("    ! Empty input. Please try again.")
             continue
-        path = os.path.expanduser(os.path.expandvars(raw))
+        path = _canonical_path(raw)
         if not os.path.isfile(path):
             print(f"    ! Not a valid file: {path}")
             continue
-        _oda_resolved_path = os.path.abspath(path)
+        _oda_resolved_path = path
         return _oda_resolved_path
 
 
@@ -390,37 +411,65 @@ def _configure_odafc() -> None:
     ``odafc`` addon so subsequent DWG opens succeed. Called lazily (from
     ``_load_doc``) on the first DWG file encountered.
 
-    Three things are done in order so the setting sticks across every
-    ezdxf variant we have seen in the wild:
+    Order of operations is deliberate — PATH injection happens BEFORE any
+    ezdxf attribute is touched, because the documented odafc code path in
+    ezdxf 1.x validates the binary with ``shutil.which()`` during the very
+    first attribute access / readfile() call:
 
-      1. ``ezdxf.addons.odafc.configs.odafc_exec_path``  (configs submodule
-         — present in some forks, silently ignored if missing)
-      2. ``ezdxf.addons.odafc.win_exec_path`` /
-         ``ezdxf.addons.odafc.unix_exec_path``            (documented in 1.x)
-      3. Inject the binary's directory into ``os.environ["PATH"]`` so that
-         the ``shutil.which()`` lookup inside ezdxf finds the executable
-         even when the above two attributes are ignored. This is the
-         actual workaround — several ezdxf releases hard-check PATH via
-         shutil.which() before honouring the configured exec_path.
+      1. Canonicalise the resolved path with pathlib + os.path.normpath so
+         Windows slashes / case / trailing whitespace are consistent.
+      2. Prepend the binary's directory to ``os.environ["PATH"]`` so
+         subsequent ``shutil.which("ODAFileConverter")`` calls resolve to
+         the right file regardless of what ezdxf does internally. This
+         is the "final-boss" workaround for the "Could not find
+         ODAFileConverter in the path" error.
+      3. Set ``ezdxf.addons.odafc.configs.odafc_exec_path`` if that
+         submodule is present in the installed ezdxf variant.
+      4. Set ``ezdxf.addons.odafc.win_exec_path`` (or ``unix_exec_path``)
+         to the canonical path — documented ezdxf 1.x API.
+      5. Verify the configuration with ``shutil.which()`` and print a
+         diagnostic showing both the quoted and unquoted forms so the
+         user can sanity-check them manually if something still fails.
     """
     global _odafc_configured
     if _odafc_configured:
         return
 
-    path = _resolve_oda_path()
-    if not path:
-        # Nothing resolved - let ezdxf try its own PATH search as last resort.
+    raw_path = _resolve_oda_path()
+    if not raw_path:
         _odafc_configured = True
         return
 
-    # --- (1) configs submodule (try first, gracefully skip if missing) -----
+    # --- (1) canonicalise -------------------------------------------------
+    path = _canonical_path(raw_path)
+    if not os.path.isfile(path):
+        print(f"[WARN] ODA Converter path is not a file: {path}")
+        _odafc_configured = True
+        return
+
+    quoted_form = f'"{path}"'  # useful when a user pastes the path in cmd.exe
+    print(f"[INFO] Canonical ODA path   : {path}")
+    print(f"[INFO] Force-quoted variant : {quoted_form}")
+
+    # --- (2) PATH injection (BEFORE touching ezdxf!) ----------------------
+    exe_dir = os.path.dirname(path)
+    if exe_dir and os.path.isdir(exe_dir):
+        current_path = os.environ.get("PATH", "")
+        path_parts = current_path.split(os.pathsep) if current_path else []
+        if exe_dir not in path_parts:
+            os.environ["PATH"] = exe_dir + os.pathsep + current_path
+            print(f"[INFO] Injected ODA directory into PATH: {exe_dir}")
+        else:
+            print(f"[INFO] ODA directory already on PATH: {exe_dir}")
+
+    # --- (3) configs submodule (silent no-op if not present) --------------
     try:
         import ezdxf.addons.odafc.configs as odafc_configs  # type: ignore
         odafc_configs.odafc_exec_path = path
     except Exception:
         pass
 
-    # --- (2) documented module-level attribute API --------------------------
+    # --- (4) documented module-level attribute API ------------------------
     try:
         from ezdxf.addons import odafc
         if sys.platform == "win32":
@@ -430,18 +479,28 @@ def _configure_odafc() -> None:
     except Exception as exc:
         print(f"[WARN] Could not set ezdxf odafc exec path: {exc}")
 
-    # --- (3) inject the binary's directory into os.environ["PATH"] ---------
-    # This is the real workaround: ezdxf's odafc helper calls shutil.which()
-    # under the hood, which only consults the PATH environment variable. By
-    # prepending the folder that contains OdaFileConverter.exe we guarantee
-    # shutil.which() returns a hit regardless of which ezdxf release is used.
-    exe_dir = os.path.dirname(path)
-    if exe_dir:
-        current_path = os.environ.get("PATH", "")
-        path_parts = current_path.split(os.pathsep) if current_path else []
-        if exe_dir not in path_parts:
-            os.environ["PATH"] = exe_dir + os.pathsep + current_path
-            print(f"[INFO] Injected ODA directory into PATH: {exe_dir}")
+    # --- (5) verify with shutil.which() -----------------------------------
+    import shutil
+    candidates = ("ODAFileConverter", "OdaFileConverter",
+                  "ODAFileConverter.exe", "OdaFileConverter.exe")
+    which_hit = None
+    for cand in candidates:
+        found = shutil.which(cand)
+        if found:
+            which_hit = (cand, found)
+            break
+    if which_hit:
+        print(f"[INFO] shutil.which({which_hit[0]!r}) -> {which_hit[1]}")
+    else:
+        # Last-ditch: try the absolute path itself.
+        direct = shutil.which(path)
+        if direct:
+            print(f"[INFO] shutil.which(<abs path>) -> {direct}")
+        else:
+            print("[WARN] shutil.which() still cannot locate the converter.")
+            print(f"       PATH[0] = {os.environ['PATH'].split(os.pathsep)[0]}")
+            print("       Try running the quoted form above manually in cmd.exe")
+            print("       to confirm the file is executable.")
 
     _odafc_configured = True
 
