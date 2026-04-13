@@ -1,29 +1,30 @@
 """
-app.py  —  PDF <-> CAD Drawing Cross-Check  (V7)
+app.py  —  PDF <-> CAD Drawing Cross-Check  (V8)
 ================================================
 Compares a master "PDF Drawing List" against the actual CAD drawings
-(.dwg / .dxf) living in a directory, without moving or copying any files
-(so external references / Xref paths remain intact).
+(.dwg / .dxf) in a directory, without moving any files so Xref relative
+paths remain intact.
 
 Pipeline
 --------
 1. Interactive prompts  : TARGET_DIR, PDF_PATH, BLOCK_NAME
-2. PDF extraction       : pdfplumber (3-tier fallback)
+2. PDF extraction       : pdfplumber with 3-tier fallback
                             Tier 1  – default table extraction
                             Tier 2  – tuned table settings (text strategy)
                             Tier 3  – raw text + per-line regex parsing
-3. DWG extraction       : ezdxf, Model Space only
-                          os.chdir(TARGET_DIR) preserves Xref relative paths
+3. DWG extraction       : ezdxf, Model Space only, os.chdir() preserves Xref
 4. Compare & Report     : outer-merge on Drawing Number -> report.xlsx
                           red cells on mismatch / missing rows
 
----- V7 changes ----
-* ODA_PATH global: set this to the full path of OdaFileConverter.exe if the
-  binary is not on your system PATH (Windows: Program Files/ODA/…).
-* PDF extraction now has 3 tiers so borderless / plain-text PDFs are parsed
-  correctly even when pdfplumber finds no formal table structure.
-* _debug_pdf_page() prints a raw-text snippet from page 1 so you can see
-  exactly what pdfplumber is reading.
+---- V8 changes ----
+* ODA_PATH now defaults to the standard Windows install of OdaFileConverter
+  27.1.0.  _configure_odafc() is called once before the first DWG open.
+* _load_doc() wraps odafc.readfile in try/except and emits a clean
+  "ODA Converter not found at [...]" message on failure.
+* Drawing-number parsing now handles the spaced format "AA - 401" that
+  appears in real-world Korean drawing lists, and every extracted number
+  is normalised through _normalize_drawing_number() so the PDF and DWG
+  sides always merge on the canonical "AA-401" form.
 """
 
 from __future__ import annotations
@@ -48,31 +49,59 @@ from openpyxl.styles import PatternFill
 # GLOBAL TWEAKABLE CONSTANTS
 # ============================================================================
 
-# --- DWG / ODA ---------------------------------------------------------------
-# Full path to OdaFileConverter executable.
-# Leave as "" to rely on the system PATH (default install adds it automatically).
-# Example (Windows): r"C:\Program Files\ODA\ODAFileConverter\OdaFileConverter.exe"
-ODA_PATH: str = ""
+# --- ODA File Converter ------------------------------------------------------
+# Full path to the OdaFileConverter executable. Set this to the path on your
+# machine; ezdxf will be configured automatically when the first DWG opens.
+# If left empty ("") ezdxf falls back to the system PATH search.
+ODA_PATH: str = r"C:\Program Files\ODA\ODAFileConverter 27.1.0\ODAFileConverter.exe"
 
-# --- Title-block search ratios -----------------------------------------------
+# --- Title-block search ratios ----------------------------------------------
 X_RATIO: float = 0.101    # 10.10 %  search width  = Title-Block Width  * X_RATIO
 Y_RATIO: float = 0.2138   # 21.38 %  search height = Title-Block Height * Y_RATIO
 
 # --- Misc --------------------------------------------------------------------
-# Default output filename (written to the cwd where app.py is invoked).
 REPORT_NAME: str = "report.xlsx"
 
-# Regex: short alphanumeric token with at least one digit == Drawing Number
+# --- Regexes -----------------------------------------------------------------
+# Short alphanumeric token that looks like a drawing number (fallback parser).
 # Examples: A-101  S_002  MEP-12B  DWG01
 _DRAWING_NUMBER_RE = re.compile(
     r"^[A-Za-z]{0,5}[-_]?\d{1,5}[A-Za-z0-9\-_.]*$"
 )
 
-# Regex: scale expressions at the tail of a text line
+# Scale expressions at the tail of a text line.
 _SCALE_RE = re.compile(
     r"\b(1\s*[:/]\s*\d+|NTS|N\.T\.S\.|AS\s+SHOWN)\b",
     re.IGNORECASE,
 )
+
+# Primary line-level regex for real-world Korean drawing lists of the form:
+#     "AA - 401 101동 영구저류조 (SL+53.355) 전체 평면도 1/100 1/200"
+# Captures:
+#     1) letter prefix      : "AA"
+#     2) numeric core       : "401"      (optionally followed by A-Z0-9)
+#     3) drawing name       : "101동 ... 전체 평면도"       (non-greedy)
+#     4) trailing scale(s)  : "1/100 1/200"  (optional - may be absent)
+_PDF_LINE_SPACED_RE = re.compile(
+    r"^\s*([A-Za-z]{1,5})\s*-\s*(\d{1,5}[A-Za-z0-9]*)\s+"
+    r"(.+?)"
+    r"(?:\s+("
+    r"\d+\s*/\s*\d+(?:\s+\d+\s*/\s*\d+)*"        # 1/100  or  1/100 1/200
+    r"|\d+\s*:\s*\d+"                              # 1:100
+    r"|NTS|N\.T\.S\.|AS\s+SHOWN"                   # textual scales
+    r"))?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_drawing_number(s: str) -> str:
+    """
+    Strip all internal whitespace from a drawing number so that
+    "AA - 401" and "AA-401" compare equal when merging PDF vs DWG rows.
+    """
+    if not s:
+        return ""
+    return re.sub(r"\s+", "", s)
 
 
 # ============================================================================
@@ -136,7 +165,7 @@ def _find_col(header: List[str], keys: List[str]) -> Optional[int]:
 def _debug_pdf_page(page) -> None:
     """Print a raw-text snippet from a page so you can diagnose parsing."""
     raw = page.extract_text() or ""
-    snippet = raw[:600]
+    snippet = raw[:800]
     print("[PDF ] -------- raw text snippet (page 1) --------")
     for line in snippet.splitlines():
         print(f"[PDF ]   {line}")
@@ -166,7 +195,11 @@ def _rows_from_table(table: list) -> List[dict]:
             scale = (raw[idx_scale] or "").strip()
         if not number:
             continue
-        rows.append({"Drawing Number": number, "Drawing Name": name, "Scale": scale})
+        rows.append({
+            "Drawing Number": _normalize_drawing_number(number),
+            "Drawing Name":   name,
+            "Scale":          scale,
+        })
     return rows
 
 
@@ -202,25 +235,37 @@ def _try_table_tuned(page) -> List[dict]:
 
 def _parse_text_line(line: str) -> Optional[dict]:
     """
-    Parse one text line into {Drawing Number, Drawing Name, Scale}.
+    Parse one raw text line into {Drawing Number, Drawing Name, Scale}.
 
-    Expects layout like:
-        A-101   FIRST FLOOR PLAN   1:100
-    Columns are separated by 2+ spaces (fixed-width alignment).
-    Scale expression is detected at the end of the line and stripped first.
+    Two strategies:
+
+    A) Spaced-number regex - handles "AA - 401 Name ... 1/100":
+           AA - 401 101동 영구저류조 (SL+53.355) 전체 평면도 1/100 1/200
+
+    B) Fixed-width fallback - splits on 2+ spaces and uses the short
+       alphanumeric heuristic for the first column.
     """
     line = line.strip()
     if not line:
         return None
 
-    # Peel scale off the end first
+    # ---- Strategy A: spaced drawing number regex ---------------------------
+    m = _PDF_LINE_SPACED_RE.match(line)
+    if m:
+        letters, digits, name, scale = m.groups()
+        return {
+            "Drawing Number": _normalize_drawing_number(f"{letters}-{digits}"),
+            "Drawing Name":   (name or "").strip(),
+            "Scale":          (scale or "").strip(),
+        }
+
+    # ---- Strategy B: fixed-width fallback ----------------------------------
     scale = ""
     m_sc = _SCALE_RE.search(line)
     if m_sc:
         scale = m_sc.group(1).strip()
         line = (line[:m_sc.start()] + line[m_sc.end():]).strip()
 
-    # Split on 2+ whitespace (column delimiter in fixed-width text PDFs)
     parts = re.split(r"\s{2,}", line)
     if len(parts) < 2:
         return None
@@ -231,7 +276,7 @@ def _parse_text_line(line: str) -> Optional[dict]:
     squashed = candidate_no.replace(" ", "")
     if _DRAWING_NUMBER_RE.match(squashed) and any(ch.isdigit() for ch in squashed):
         return {
-            "Drawing Number": candidate_no,
+            "Drawing Number": _normalize_drawing_number(candidate_no),
             "Drawing Name":   candidate_name,
             "Scale":          scale,
         }
@@ -255,11 +300,6 @@ def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
     """
     Parse every page of *pdf_path* and return a DataFrame with columns
     ``Drawing Number``, ``Drawing Name``, ``Scale``.
-
-    Three tiers are tried in order per page:
-      1. Default pdfplumber table detection
-      2. Text-strategy table detection (looser tolerances)
-      3. Raw text + per-line regex parsing
     """
     print(f"[PDF ] Opening: {pdf_path}")
     all_rows: List[dict] = []
@@ -269,13 +309,11 @@ def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
         with pdfplumber.open(pdf_path) as pdf:
             for page_no, page in enumerate(pdf.pages, 1):
 
-                # Print raw-text snippet from the very first page.
                 if not debug_done:
                     _debug_pdf_page(page)
                     debug_done = True
 
                 before = len(all_rows)
-                strategy = ""
 
                 page_rows = _try_table_default(page)
                 if page_rows:
@@ -311,26 +349,78 @@ def extract_pdf_table(pdf_path: str) -> pd.DataFrame:
 # 3.  DWG / DXF EXTRACTION  (Model Space only)
 # ============================================================================
 
-def _load_doc(path: Path):
-    """
-    Load a DXF file natively, or convert a DWG via the ODA File Converter.
+# --- ODA File Converter configuration ---------------------------------------
+_odafc_configured = False
 
-    If ODA_PATH is set (non-empty) the converter executable is configured
-    explicitly; otherwise ezdxf searches the system PATH.
+
+def _configure_odafc() -> None:
     """
+    Explicitly point ezdxf's odafc addon at the OdaFileConverter executable
+    defined in ODA_PATH. Called once before the first DWG open.
+
+    Two APIs are attempted in order so the configuration works across ezdxf
+    versions:
+
+    1.  ``ezdxf.addons.odafc.configs.odafc_exec_path``  (user-supplied hint)
+    2.  ``ezdxf.addons.odafc.win_exec_path`` /
+        ``ezdxf.addons.odafc.unix_exec_path``          (documented in 1.x)
+    """
+    global _odafc_configured
+    if _odafc_configured or not ODA_PATH:
+        return
+
+    # --- (1) user-requested configs submodule -------------------------------
+    try:
+        import ezdxf.addons.odafc.configs as odafc_configs  # type: ignore
+        odafc_configs.odafc_exec_path = ODA_PATH
+    except Exception:
+        pass  # submodule does not exist in current ezdxf - fall through
+
+    # --- (2) documented module-level attribute API --------------------------
+    try:
+        from ezdxf.addons import odafc
+        if sys.platform == "win32":
+            odafc.win_exec_path = ODA_PATH
+        else:
+            odafc.unix_exec_path = ODA_PATH
+    except Exception as exc:
+        print(f"[WARN] Could not set ezdxf odafc exec path: {exc}")
+
+    _odafc_configured = True
+
+
+def _load_doc(path: Path):
+    """Load a DXF natively or a DWG via the ODA File Converter addon."""
     suffix = path.suffix.lower()
+
     if suffix == ".dxf":
-        return ezdxf.readfile(str(path))
+        try:
+            return ezdxf.readfile(str(path))
+        except Exception as exc:
+            raise RuntimeError(f"ezdxf could not read {path.name}: {exc}") from exc
 
     if suffix == ".dwg":
-        from ezdxf.addons import odafc
-        if ODA_PATH:
-            # Set the platform-appropriate attribute before calling readfile.
-            if sys.platform == "win32":
-                odafc.win_exec_path = ODA_PATH
-            else:
-                odafc.unix_exec_path = ODA_PATH
-        return odafc.readfile(str(path))
+        _configure_odafc()
+        try:
+            from ezdxf.addons import odafc
+            return odafc.readfile(str(path))
+        except FileNotFoundError as exc:
+            # Raised by odafc when the converter binary itself is missing.
+            raise RuntimeError(
+                f"ODA Converter not found at [{ODA_PATH or '<system PATH>'}] "
+                f"(underlying error: {exc})"
+            ) from exc
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "odafileconverter" in msg or "oda_file_converter" in msg \
+               or "no such file" in msg or "cannot find" in msg:
+                raise RuntimeError(
+                    f"ODA Converter not found at [{ODA_PATH or '<system PATH>'}] "
+                    f"(underlying error: {exc})"
+                ) from exc
+            raise RuntimeError(
+                f"odafc failed to read {path.name}: {exc}"
+            ) from exc
 
     raise ValueError(f"Unsupported CAD file extension: {suffix}")
 
@@ -377,16 +467,23 @@ def _compute_insert_bbox(insert):
     return None
 
 
+def _looks_like_drawing_number(text: str) -> bool:
+    """True if *text* (after squashing whitespace) looks like a drawing number."""
+    squashed = re.sub(r"\s+", "", text)
+    return bool(
+        _DRAWING_NUMBER_RE.match(squashed)
+        and any(ch.isdigit() for ch in squashed)
+    )
+
+
 def _pair_number_and_name(
     hits: List[Tuple[float, float, str]],
 ) -> Tuple[str, str]:
     """
     From texts inside the search rectangle, identify Drawing Number and Name.
 
-    Strategy:
-      1. Regex: short alphanumeric token with a digit → Drawing Number.
-      2. Remaining descriptive text → Drawing Name.
-      3. Positional fallback: topmost text = number, next = name.
+    The Drawing Number is normalised via _normalize_drawing_number() so that
+    "AA - 401" in a DWG and "AA-401" in the PDF merge onto the same row.
     """
     if not hits:
         return "", ""
@@ -394,8 +491,7 @@ def _pair_number_and_name(
     numbers: List[Tuple[float, float, str]] = []
     others:  List[Tuple[float, float, str]] = []
     for x, y, text in hits:
-        squashed = text.replace(" ", "")
-        if _DRAWING_NUMBER_RE.match(squashed) and any(ch.isdigit() for ch in squashed):
+        if _looks_like_drawing_number(text):
             numbers.append((x, y, text))
         else:
             others.append((x, y, text))
@@ -403,12 +499,12 @@ def _pair_number_and_name(
     if numbers and others:
         numbers.sort(key=lambda h: -h[1])
         others.sort(key=lambda h: -h[1])
-        return numbers[0][2], others[0][2]
+        return _normalize_drawing_number(numbers[0][2]), others[0][2]
 
     hits_sorted = sorted(hits, key=lambda h: -h[1])
     if len(hits_sorted) >= 2:
-        return hits_sorted[0][2], hits_sorted[1][2]
-    return hits_sorted[0][2], ""
+        return _normalize_drawing_number(hits_sorted[0][2]), hits_sorted[1][2]
+    return _normalize_drawing_number(hits_sorted[0][2]), ""
 
 
 def extract_dwg_data(target_dir: str, block_name: str) -> pd.DataFrame:
@@ -473,7 +569,6 @@ def extract_dwg_data(target_dir: str, block_name: str) -> pd.DataFrame:
                     if width <= 0 or height <= 0:
                         continue
 
-                    # Search rectangle: bottom-right corner (Max_X, Min_Y) as origin
                     sx_max = max_x
                     sx_min = max_x - width  * X_RATIO
                     sy_min = min_y
@@ -604,6 +699,9 @@ def main() -> None:
     if ODA_PATH:
         print(f"[INFO] ODA path   : {ODA_PATH}")
     print("-" * 72)
+
+    # Configure ezdxf's ODA addon up front so the very first DWG open works.
+    _configure_odafc()
 
     out_path = os.path.abspath(REPORT_NAME)
 
